@@ -1,335 +1,345 @@
-1. AWS Zero Downtime with Oracle + GoldenGate + AWS + Cicso UCS
-end-to-end step-by-step setup guide for a 3-region active-active Oracle 19c design on AWS using GoldenGate (Microservices or Classic).
+<p align="center">
+  <img src="https://raw.githubusercontent.com/chrisfatienza/SpecialProjects/main/awx-zero-downtime-oracle%20at%20AWS%20and%20cisco%20UCS.png" width="100%" />
+</p>
 
-Reference architecture (what you’re building)
+# Oracle 19c Multi-Region Active-Active Architecture (Multi-Write)
+### AWS + RHEL 9 + Oracle GoldenGate
 
-3 AWS Regions (example):
+---
 
-us-east-1 (N. Virginia)
+## 📌 Overview
 
-eu-central-1 (Frankfurt)
+This repository documents the complete end-to-end setup of an **Oracle Database 19c multi-region active-active (multi-write) architecture** using:
 
-ap-southeast-1 (Singapore)
+- AWS (3 Regions)
+- RHEL 9
+- Oracle Database 19c (19.19+)
+- Oracle GoldenGate (Microservices Architecture)
+- Conflict Detection & Resolution (CDR)
 
-In each region
+This design allows **writes in any region** with near real-time replication to other regions.
 
-VPC + subnets (public + private)
+---
 
-EC2 instances running RHEL 9 + Oracle Database 19c (19.19+)
+# 🏗 Architecture Summary
 
-One or more EC2 instances running Oracle GoldenGate (can be “hub” style or local-per-region)
+### Regions
+- `us-east-1` (N. Virginia)
+- `eu-central-1` (Frankfurt)
+- `ap-southeast-1` (Singapore)
 
-Route 53 / Global Accelerator to route clients to nearest region
+### In Each Region
+- VPC (non-overlapping CIDR)
+- EC2 for Oracle Database
+- EC2 for GoldenGate
+- EBS storage
+- Private subnets
+- Monitoring & logging
 
-TLS + KMS encryption + monitoring
+### Replication Model
+- Active-Active (multi-write)
+- Full mesh replication (A↔B, B↔C, C↔A)
+- Conflict Detection & Resolution enabled
 
-GoldenGate active-active
+---
 
-Bidirectional replication (A↔B, B↔C, C↔A) or hub-and-spoke
+# ⚠ Important Design Decision
 
-Conflict Detection & Resolution (CDR) configured (required for active-active)
+Choose your model before deployment:
 
-Reality check: multi-write is doable, but you must design conflict strategy, key generation, and often data ownership rules (more on this below).
+## Model A – True Active-Active (Same Tables Writable Everywhere)
+- Requires GoldenGate CDR
+- Higher operational complexity
+- Must handle update conflicts
 
-Step 0 — Decide your multi-write model (critical)
+## Model B – Write-Local / Data Ownership Model (Recommended)
+- Each region owns specific rows or tenants
+- Conflicts minimized by design
+- GoldenGate distributes data globally
 
-Pick ONE of these, or your project will hurt later:
+## Model C – Single Writer + Data Guard
+- Not multi-write
+- Simpler
+- Strong consistency
 
-Model A: “Same tables writable everywhere” (true active-active)
+---
 
-Needs GoldenGate CDR
+# 🛠 Step 1 – AWS Network Setup (Per Region)
 
-Hardest (conflicts possible)
+1. Create VPC (unique CIDR per region)
+2. Create subnets:
+   - Public
+   - Private App
+   - Private DB
+   - Private GoldenGate
+3. Configure:
+   - Transit Gateway OR inter-region VPC peering
+   - Security groups (DB 1521, GG ports, SSH restricted)
+   - NACLs (optional)
 
-Model B: “Write-local / own-your-record” (recommended)
+---
 
-Each region owns specific rows/tenants (by region/tenant key)
+# 🖥 Step 2 – Provision Oracle 19c (Per Region)
 
-Replication distributes changes globally
+## 1. Launch EC2
+- RHEL 9
+- Separate EBS volumes:
+  - /u01 (Oracle Home)
+  - Data
+  - Redo
+  - Archive
+  - FRA
 
-Conflicts are rare by design
+## 2. Install Oracle 19c (19.19+ minimum)
 
-Model C: “Single-writer + fast failover”
+## 3. Create Database
+Recommended:
+- CDB + PDB model
 
-Use Data Guard; not multi-write
+---
 
-Best consistency, simpler ops
+# 🗄 Step 3 – Prepare Oracle for GoldenGate
 
-If you still want multi-write “regardless of location,” Model B is the best way to deliver that safely.
+## Enable Archivelog + Force Logging
 
-Step 1 — Build AWS networking (3 regions)
-
-For each region:
-
-Create VPC (non-overlapping CIDRs across regions)
-
-Create subnets:
-
-Public subnet(s): bastion / LB (optional)
-
-Private app subnet(s)
-
-Private DB subnet(s)
-
-Private GG subnet(s)
-
-Connectivity between regions
-
-Easiest: Transit Gateway + inter-region peering, or VPN/Direct Connect between regions
-
-Ensure low-latency paths and no asymmetric routing issues
-
-Security:
-
-Security groups: allow DB (1521), GoldenGate ports (depends on deployment), SSH (restricted)
-
-NACLs: keep simple unless required
-
-Step 2 — Provision EC2 for Oracle DB (each region)
-
-Launch EC2 (sizing depends on workload), attach EBS volumes:
-
-Data
-
-Redo
-
-Archive
-
-FRA / backup
-
-Install RHEL 9, patch baseline, set:
-
-hostname, DNS, NTP/chrony
-
-kernel params and limits for Oracle
-
-Install Oracle 19c 19.19+ on RHEL 9
-
-Create CDB/PDB (recommended) and your application schema.
-
-Step 3 — Configure Oracle DB for GoldenGate (each region)
-
-On each database:
-
-Set archivelog + force logging:
-
+```sql
 shutdown immediate;
 startup mount;
 alter database archivelog;
 alter database force logging;
 alter database open;
+```
 
+## Enable Supplemental Logging
 
-Enable supplemental logging (minimum + table-level as needed):
-
+```sql
 alter database add supplemental log data;
 alter database add supplemental log data (primary key) columns;
--- If tables lack PKs, you’ll need ALL columns (expensive) or add keys.
+```
 
+## Create GoldenGate User
 
-Create a GoldenGate admin user (least privilege approach varies by GG mode; typical example):
-
-create user ggs_admin identified by "StrongPwd...";
+```sql
+create user ggs_admin identified by "StrongPassword";
 grant create session to ggs_admin;
--- plus required privileges per Oracle GG docs for integrated extract/replicat
+-- Add required GoldenGate privileges per Oracle documentation
+```
 
+### Requirements
+- All tables must have Primary Keys
+- Avoid non-deterministic triggers
+- Ensure global unique key strategy
 
-Ensure unique row identifiers everywhere:
+---
 
-Primary keys on all replicated tables
+# 🔁 Step 4 – Install Oracle GoldenGate (Microservices)
 
-Avoid triggers that generate non-deterministic values unless handled carefully
+Recommended: GoldenGate Microservices Architecture
 
-Step 4 — GoldenGate topology choice
-Option 1: GoldenGate Microservices Architecture (recommended)
+## On GoldenGate EC2
 
-Web UI + REST services
+1. Install required OS libraries
+2. Install GoldenGate software
+3. Create deployment:
+   - dep-use1
+   - dep-euc1
+   - dep-apse1
 
-Easier lifecycle and HA patterns
+Open required ports securely (Admin Server, Distribution Server, Receiver Server).
 
-Oracle’s install flow is: install → env vars → deploy instance via config assistant
+---
 
-Option 2: Classic (ggsci)
+# 📦 Step 5 – Initial Data Load
 
-Works fine; more CLI-centric
+Choose one region as initial source (example: us-east-1)
 
-The AWS blog posts show HA patterns for GG hubs on EC2 and Microservices HA guidance.
+## Option A – Data Pump Method (Recommended)
 
-Step 5 — Install GoldenGate (each region)
+1. Stop application writes briefly
+2. Export schema
+3. Import into other regions
+4. Record SCN
+5. Start Extract from recorded SCN
 
-Provision EC2 for GG (can be separate from DB; recommended separate)
+---
 
-Install prerequisites (Java for Microservices, OS libs)
+# 🔄 Step 6 – Configure Replication
 
-Install GG software
+## Recommended Topology: Full Mesh
 
-Create GG deployment(s):
+- US ↔ EU
+- EU ↔ APAC
+- APAC ↔ US
 
-dep-use1, dep-euc1, dep-apse1
+---
 
-Open required ports (Admin Server, Receiver Server, Distribution Server, etc.) and lock them down to private networks.
+# 🧲 Step 7 – Configure Extract (Per Region)
 
-Step 6 — Initial load (get all regions consistent)
+1. Create credential store
+2. Create Integrated Extract
+3. Create local trail
+4. Configure distribution path to other regions
 
-Pick a system of record to seed the other regions (initially).
+---
 
-Approach A (common): Data Pump + start replication from a point-in-time
-
-Stop application writes briefly (or use consistent snapshot method)
-
-Export schema from Region A
-
-Import into Regions B and C
-
-Record SCN/time
-
-Start Extract from that SCN so changes after export are replicated
-
-Approach B: GoldenGate initial load (supported patterns)
-
-Use GG to do initial load then switch to CDC.
-
-Step 7 — Configure replication paths (3 regions)
-
-You have two sane patterns:
-
-Pattern 1: “Full mesh” (A↔B, B↔C, C↔A)
-
-Lowest dependency
-
-More streams to manage
-
-Pattern 2: “Hub-and-spoke”
-
-Region A is hub
-
-Simpler streams, hub is critical
-
-For “regardless of location,” full mesh is common.
-
-Step 8 — Create Extract + Pump (CDC capture)
-
-On each region’s GG deployment:
-
-Create credential alias to the local DB (Microservices)
-
-Create Integrated Extract capturing changes from the local DB (best for Oracle)
-
-Create a trail
-
-Create Distribution/Receiver paths to other regions
-
-Repeat per region.
-
-Step 9 — Create Replicat (apply) + mapping rules
+# 🔄 Step 8 – Configure Replicat (Per Region)
 
 For each inbound stream:
 
-Create Replicat to apply remote changes into local DB
+1. Create Replicat process
+2. Define mappings:
 
-Define table mappings:
+```
+MAP schema.table, TARGET schema.table;
+```
 
-Include/exclude tables
+3. Enable DDL replication (if required)
 
-Include DDL rules if needed (be careful with DDL in active-active)
+---
 
-Handle sequences/identity:
+# ⚖ Step 9 – Conflict Detection & Resolution (CDR)
 
-Prefer region-coded key ranges (best)
+Required for Active-Active.
 
-Or use UUIDs at app layer
+## Common Conflict Types
 
-Avoid “same sequence everywhere” without strategy
+- Update vs Update
+- Insert vs Insert (PK collision)
+- Delete vs Update
 
-Step 10 — Enable Active-Active conflict handling (CDR)
+## Resolution Strategies
 
-Because active-active can create collisions, you must decide:
+- Last update wins (timestamp)
+- Region priority
+- Custom PL/SQL handlers
 
-Conflicts you must plan for
+Recommended: Design to avoid conflicts rather than resolve them.
 
-Update/update same row in different regions
+---
 
-Delete/update
+# 🔐 Step 10 – Key Strategy (Critical)
 
-Insert/insert (PK collision)
+Recommended approaches:
 
-GoldenGate provides Conflict Detection and Resolution specifically for active-active.
+- UUID at application layer
+- Region-based numeric ranges
+  - US: 1–1B
+  - EU: 1B–2B
+  - APAC: 2B–3B
 
-Common resolution policies:
+Avoid shared sequence without coordination.
 
-“Last update wins” (timestamp-based)
+---
 
-“Region priority” (US wins, else EU, else APAC)
+# 🌍 Step 11 – Client Routing
 
-“Custom handlers” (business logic)
+To allow “write anywhere”:
 
-Best practice: avoid conflicts by design (Model B: row ownership/partitioning) and use CDR as a safety net.
+## Option 1 – Route 53 Latency-Based Routing
+Clients connect to nearest region.
 
-Step 11 — Routing: “write anywhere” user experience
+## Option 2 – AWS Global Accelerator
+Improved global performance and failover.
 
-To make it feel location-independent:
+Application writes locally; GoldenGate replicates globally.
 
-Route clients to nearest region
+---
 
-Route 53 latency-based routing OR Global Accelerator
+# 🛡 Step 12 – High Availability for GoldenGate
 
-Application connects to local Oracle in-region
+GoldenGate is critical infrastructure.
 
-Writes happen locally
+Recommended:
+- 2 EC2 instances per region (active/passive)
+- NLB for Microservices endpoints
+- Auto-restart policies
+- Monitoring for lag and process health
 
-GoldenGate replicates changes to other regions
+---
 
-Important app considerations:
+# 📊 Step 13 – Monitoring
 
-Read-your-writes: may require session affinity or local reads
+Monitor:
 
-Global uniqueness: IDs must be globally unique without coordination
+- Replication lag
+- Extract status
+- Replicat status
+- Trail disk usage
+- Redo generation rate
+- Cross-region latency
 
-Step 12 — HA for GoldenGate itself
+---
 
-GoldenGate is part of your write path (for convergence), so make it HA:
+# 🧪 Step 14 – Validation Checklist
 
-Run GG hub/deployment on 2 EC2 instances (active/passive or active/active where supported)
+- [ ] Write in US appears in EU + APAC
+- [ ] Write in EU appears in US + APAC
+- [ ] Conflict simulation works as expected
+- [ ] Kill GoldenGate process → auto-recovery
+- [ ] Region network partition test
+- [ ] Full region rebuild test
 
-Put them behind a Network Load Balancer for Microservices endpoints (where appropriate)
+---
 
-Monitor and auto-restart Extract/Replicat
+# 🔄 Operational Runbooks Required
 
-AWS explicitly notes the GG “hub on EC2” is not managed by RDS and should be monitored to ensure processes resume after failover.
-AWS also provides reference HA patterns for GG hubs on EC2.
+You must document:
 
-Step 13 — Observability + operations
+- Resync table procedure
+- Rebuild region from another region
+- Handling replication lag
+- Maintenance window process
+- GoldenGate upgrade process
 
-Minimum monitoring:
+---
 
-GG lag per stream (seconds + bytes)
+# 📈 Performance Considerations
 
-Extract/Replicat status
+- Monitor redo generation rate
+- Cross-region latency impacts convergence time
+- Avoid large batch commits during peak replication
 
-Trail space usage
+---
 
-DB metrics: log switches, archive destination space, redo rates
+# 🚨 Risks & Warnings
 
-Network latency between regions
+- Multi-write introduces conflict risk
+- Network partitions can cause divergence
+- Operational complexity significantly higher than Data Guard
+- Requires strong DBA + replication expertise
 
-Runbooks:
+---
 
-How to pause replication for maintenance
+# 📚 When NOT to Use Multi-Write
 
-How to resync a table
+Do not use active-active if:
 
-How to rebuild a region from another region
+- Strict serial consistency required
+- No tolerance for conflict logic
+- Low operational maturity
+- Team unfamiliar with GoldenGate
 
-Step 14 — Testing checklist (must pass before go-live)
+Use Data Guard instead.
 
-Write in US → appears in EU + APAC within SLA
+---
 
-Write in EU → appears in US + APAC
+# 📌 Summary
 
-Simulate conflict → confirm resolution behavior
+Multi-write across regions with Oracle 19c:
 
-Kill GG node → automatic failover + resume
+✅ Requires Oracle GoldenGate  
+✅ Requires conflict handling  
+✅ Requires global key strategy  
+✅ Requires strong monitoring  
 
-Network partition between 2 regions → understand what happens (this is where conflicts spike)
+Recommended approach:
+Design for conflict avoidance first.
 
-Reconcile after partition → verify data correctness
+---
+
+# 👤 Author
+
+Architecture prepared for production-grade multi-region Oracle 19c deployments on AWS.
+
+---
+
